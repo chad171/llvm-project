@@ -34,7 +34,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
+from tkinter import Tk, Label, Listbox, END, SINGLE
 
 try:
     import yaml
@@ -48,11 +50,18 @@ if is_py2:
 else:
     import queue as queue
 
+file_status = {}
+file_status_lock = threading.Lock()
+file_status["ALL FILES"] = ("Started", time.time())
 
 def run_tidy(task_queue, lock, timeout, failed_files):
     watchdog = None
     while True:
         command = task_queue.get()
+        file_name = command[-1]
+        
+        with file_status_lock:
+            file_status[file_name] = ("Started", time.time())
         try:
             proc = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -72,7 +81,10 @@ def run_tidy(task_queue, lock, timeout, failed_files):
                     stderr += msg.encode("utf-8")
                 failed_files.append(command)
 
-            with lock:
+            with lock:               
+                with file_status_lock:
+                    start_time = file_status[file_name][1]
+                    file_status[file_name] = ("Finished", time.time()-start_time)
                 sys.stdout.write(stdout.decode("utf-8") + "\n")
                 sys.stdout.flush()
                 if stderr:
@@ -97,6 +109,33 @@ def start_workers(max_tasks, tidy_caller, arguments):
         t = threading.Thread(target=tidy_caller, args=arguments)
         t.daemon = True
         t.start()
+
+def update_gui(listbox):
+    listbox.delete(0, END)
+    with file_status_lock:
+        for index, (file, status_tuple) in enumerate(file_status.items(), start=1):
+            status = status_tuple[0]
+            if status == "Finished":
+                duration = status_tuple[1]  # Use the stored duration
+            else:
+                duration = time.time() - status_tuple[1]  # Calculate elapsed time since start
+            listbox.insert(END, f"{index}. {status} - {duration:.2f}s: {file}")
+    listbox.after(1000, update_gui, listbox)
+
+def show_gui():
+    root = Tk()
+    root.title("File Processing Status")
+    root.geometry("400x300")
+    
+    label = Label(root, text="Clang-Tidy File Processing Status")
+    label.pack()
+
+    listbox = Listbox(root, selectmode=SINGLE)
+    listbox.pack(fill="both", expand=True)
+
+    # Start the update loop
+    update_gui(listbox)
+    root.mainloop()
 
 
 def merge_replacement_files(tmpdir, mergefile):
@@ -179,6 +218,7 @@ def main():
         help="Specify the path of .clang-tidy or custom config file",
         default="",
     )
+    parser.add_argument("-show-gui", action="store_true", help="Show a gui for the file processing status")
     parser.add_argument("-use-color", action="store_true", help="Use colors in output")
     parser.add_argument(
         "-path", dest="build_path", help="Path used to read a compile command database."
@@ -307,6 +347,9 @@ def main():
 
     # Tasks for clang-tidy.
     task_queue = queue.Queue(max_task_count)
+    for filename in lines_by_file:
+        with file_status_lock:
+            file_status[filename] = ("Queued",time.time())
     # A lock for console output.
     lock = threading.Lock()
 
@@ -318,16 +361,21 @@ def main():
         max_task_count, run_tidy, (task_queue, lock, args.timeout, failed_files)
     )
 
+        # Start GUI if requested
+    if args.show_gui:
+        gui_thread = threading.Thread(target=show_gui)
+        gui_thread.start()
+
     # Form the common args list.
     common_clang_tidy_args = []
     if args.fix:
-        common_clang_tidy_args.append("-fix")
+        common_clang_tidy_args.append("--fix")
     if args.checks != "":
-        common_clang_tidy_args.append("-checks=" + args.checks)
+        common_clang_tidy_args.append("--checks=" + args.checks)
     if args.config_file != "":
-        common_clang_tidy_args.append("-config-file=" + args.config_file)
+        common_clang_tidy_args.append("--config-file=" + args.config_file)
     if args.quiet:
-        common_clang_tidy_args.append("-quiet")
+        common_clang_tidy_args.append("--quiet")
     if args.build_path is not None:
         common_clang_tidy_args.append("-p=%s" % args.build_path)
     if args.use_color:
@@ -335,11 +383,13 @@ def main():
     if args.allow_no_checks:
         common_clang_tidy_args.append("--allow-no-checks")
     for arg in args.extra_arg:
-        common_clang_tidy_args.append("-extra-arg=%s" % arg)
+        common_clang_tidy_args.append("--extra-arg=%s" % arg)
     for arg in args.extra_arg_before:
-        common_clang_tidy_args.append("-extra-arg-before=%s" % arg)
+        common_clang_tidy_args.append("--extra-arg-before=%s" % arg)
     for plugin in args.plugins:
-        common_clang_tidy_args.append("-load=%s" % plugin)
+        common_clang_tidy_args.append("--load=%s" % plugin)
+
+    common_clang_tidy_args.append("--warnings-as-errors=*")
 
     for name in lines_by_file:
         line_filter_json = json.dumps(
@@ -366,6 +416,13 @@ def main():
 
     # Wait for all threads to be done.
     task_queue.join()
+
+    if args.show_gui:
+        start_time = file_status["ALL FILES"][1]
+        file_status["ALL FILES"] = ("Finished", time.time()-start_time)
+        print("Waiting for GUI to close...")
+        gui_thread.join()
+
     # Application return code
     return_code = 0
     if failed_files:
